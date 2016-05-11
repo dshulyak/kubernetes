@@ -539,7 +539,7 @@ func authPathClientConfig(s *options.KubeletServer, useDefaults bool) (*restclie
 	if err != nil {
 		return nil, err
 	}
-	authConfig.Host = s.APIServerList[0]
+	authConfig.AlternateHosts = s.APIServerList
 	return &authConfig, nil
 }
 
@@ -553,8 +553,8 @@ func kubeconfigClientConfig(s *options.KubeletServer) (*restclient.Config, error
 	}
 	return clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 		&clientcmd.ClientConfigLoadingRules{ExplicitPath: s.KubeConfig.Value()},
-		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{Server: s.APIServerList[0]}},
-	).ClientConfig()
+		&clientcmd.ConfigOverrides{ClusterInfo: clientcmdapi.Cluster{
+			Server: s.APIServerList[0], Servers: s.APIServerList}}).ClientConfig()
 }
 
 // createClientConfig creates a client configuration from the command line
