@@ -123,7 +123,7 @@ func setup(t *testing.T) (*httptest.Server, *garbagecollector.GarbageCollector, 
 	masterConfig.EnableCoreControllers = false
 	_, s := framework.RunAMaster(masterConfig)
 
-	clientSet, err := clientset.NewForConfig(&restclient.Config{Host: s.URL})
+	clientSet, err := clientset.NewForConfig(&restclient.Config{Hosts: []string{s.URL}})
 	if err != nil {
 		t.Fatalf("Error in create clientset: %v", err)
 	}
@@ -131,7 +131,7 @@ func setup(t *testing.T) (*httptest.Server, *garbagecollector.GarbageCollector, 
 	if err != nil {
 		t.Fatalf("Failed to get supported resources from server: %v", err)
 	}
-	config := &restclient.Config{Host: s.URL}
+	config := &restclient.Config{Hosts: []string{s.URL}}
 	config.ContentConfig.NegotiatedSerializer = serializer.DirectCodecFactory{CodecFactory: metaonly.NewMetadataCodecFactory()}
 	metaOnlyClientPool := dynamic.NewClientPool(config, dynamic.LegacyAPIPathResolverFunc)
 	config.ContentConfig.NegotiatedSerializer = nil
