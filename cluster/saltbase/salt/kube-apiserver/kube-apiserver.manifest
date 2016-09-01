@@ -80,6 +80,7 @@
 {% set client_ca_file = "" -%}
 
 {% set secure_port = "6443" -%}
+{% set add_secure_port = "6444" -%}
 {% if grains['cloud'] is defined and grains.cloud in [ 'aws', 'gce', 'vagrant', 'vsphere', 'photon-controller', 'openstack']    %}
   {% set secure_port = "443" -%}
   {% set client_ca_file = "--client-ca-file=/srv/kubernetes/ca.crt" -%}
@@ -208,7 +209,10 @@
         "hostPort": {{secure_port}}},{
        "name": "local",
         "containerPort": 8080,
-        "hostPort": 8080}
+        "hostPort": 8080},{
+        "name": "add_https",
+        "containerPort": {{add_secure_port}},
+        "hostPort": {{add_secure_port}}}
         ],
     "volumeMounts": [
         {{cloud_config_mount}}
