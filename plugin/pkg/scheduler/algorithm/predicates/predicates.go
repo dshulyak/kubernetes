@@ -31,6 +31,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/qos"
 	"k8s.io/kubernetes/pkg/labels"
 	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
+	"k8s.io/kubernetes/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/util/workqueue"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/algorithm"
 	priorityutil "k8s.io/kubernetes/plugin/pkg/scheduler/algorithm/priorities/util"
@@ -98,12 +99,38 @@ type matchingPodAntiAffinityTerm struct {
 	node *v1.Node
 }
 
+type metadataSelectorAndNamespaceForTerm struct {
+	term       *v1.PodAffinityTerm
+	selector   labels.Selector
+	namespaces sets.String
+}
+
+func computeSelectorsAndNamespacesForTerms(pod *v1.Pod, terms []v1.PodAffinityTerm) ([]metadataSelectorAndNamespaceForTerm, error) {
+	cachedTerms := make([]metadataSelectorAndNamespaceForTerm, 0, len(terms))
+	for i := range terms {
+		term := terms[i]
+		namespaces := priorityutil.GetNamespacesFromPodAffinityTerm(pod, &term)
+		selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
+		if err != nil {
+			return nil, err
+		}
+		cachedTerms = append(cachedTerms, metadataSelectorAndNamespaceForTerm{
+			term:       &term,
+			selector:   selector,
+			namespaces: namespaces,
+		})
+	}
+	return cachedTerms, nil
+}
+
 type predicateMetadata struct {
 	pod                                *v1.Pod
 	podBestEffort                      bool
 	podRequest                         *schedulercache.Resource
 	podPorts                           map[int]bool
 	matchingAntiAffinityTerms          []matchingPodAntiAffinityTerm
+	affinityTerms                      []metadataSelectorAndNamespaceForTerm
+	antiAffinityTerms                  []metadataSelectorAndNamespaceForTerm
 	serviceAffinityMatchingPodList     []*v1.Pod
 	serviceAffinityMatchingPodServices []*v1.Service
 }
@@ -908,7 +935,6 @@ func (c *PodAffinityChecker) InterPodAffinityMatches(pod *v1.Pod, meta interface
 	if !c.satisfiesExistingPodsAntiAffinity(pod, meta, node) {
 		return false, []algorithm.PredicateFailureReason{ErrPodAffinityNotMatch}, nil
 	}
-
 	// Now check if <pod> requirements will be satisfied on this node.
 	affinity, err := v1.GetAffinityFromPodAnnotations(pod.Annotations)
 	if err != nil {
@@ -917,7 +943,7 @@ func (c *PodAffinityChecker) InterPodAffinityMatches(pod *v1.Pod, meta interface
 	if affinity == nil || (affinity.PodAffinity == nil && affinity.PodAntiAffinity == nil) {
 		return true, nil, nil
 	}
-	if !c.satisfiesPodsAffinityAntiAffinity(pod, node, affinity) {
+	if !c.satisfiesPodsAffinityAntiAffinity(pod, meta, node, affinity) {
 		return false, []algorithm.PredicateFailureReason{ErrPodAffinityNotMatch}, nil
 	}
 
@@ -934,13 +960,8 @@ func (c *PodAffinityChecker) InterPodAffinityMatches(pod *v1.Pod, meta interface
 // First return value indicates whether a matching pod exists on a node that matches the topology key,
 // while the second return value indicates whether a matching pod exists anywhere.
 // TODO: Do we really need any pod matching, or all pods matching? I think the latter.
-func (c *PodAffinityChecker) anyPodMatchesPodAffinityTerm(pod *v1.Pod, allPods []*v1.Pod, node *v1.Node, term *v1.PodAffinityTerm) (bool, bool, error) {
+func (c *PodAffinityChecker) anyPodMatchesPodAffinityTerm(pod *v1.Pod, allPods []*v1.Pod, node *v1.Node, term *v1.PodAffinityTerm, selector labels.Selector, namespaces sets.String) (bool, bool, error) {
 	matchingPodExists := false
-	namespaces := priorityutil.GetNamespacesFromPodAffinityTerm(pod, term)
-	selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
-	if err != nil {
-		return false, false, err
-	}
 	for _, existingPod := range allPods {
 		match := priorityutil.PodMatchesTermsNamespaceAndSelector(existingPod, namespaces, selector)
 		if match {
@@ -983,7 +1004,7 @@ func getPodAntiAffinityTerms(podAntiAffinity *v1.PodAntiAffinity) (terms []v1.Po
 	return terms
 }
 
-func getMatchingAntiAffinityTerms(pod *v1.Pod, nodeInfoMap map[string]*schedulercache.NodeInfo) ([]matchingPodAntiAffinityTerm, error) {
+func getMatchingAntiAffinityTerms(pod *v1.Pod, nodeInfoMap map[string]*schedulercache.NodeInfo, affinityTerms []metadataSelectorAndNamespaceForTerm) ([]matchingPodAntiAffinityTerm, error) {
 	allNodeNames := make([]string, 0, len(nodeInfoMap))
 	for name := range nodeInfoMap {
 		allNodeNames = append(allNodeNames, name)
@@ -1014,24 +1035,11 @@ func getMatchingAntiAffinityTerms(pod *v1.Pod, nodeInfoMap map[string]*scheduler
 		}
 		var nodeResult []matchingPodAntiAffinityTerm
 		for _, existingPod := range nodeInfo.PodsWithAffinity() {
-			affinity, err := v1.GetAffinityFromPodAnnotations(existingPod.Annotations)
-			if err != nil {
-				catchError(err)
-				return
-			}
-			if affinity == nil {
-				continue
-			}
-			for _, term := range getPodAntiAffinityTerms(affinity.PodAntiAffinity) {
-				namespaces := priorityutil.GetNamespacesFromPodAffinityTerm(pod, &term)
-				selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
-				if err != nil {
-					catchError(err)
-					return
-				}
-				match := priorityutil.PodMatchesTermsNamespaceAndSelector(pod, namespaces, selector)
+			for i := range affinityTerms {
+				term := affinityTerms[i]
+				match := priorityutil.PodMatchesTermsNamespaceAndSelector(existingPod, term.namespaces, term.selector)
 				if match {
-					nodeResult = append(nodeResult, matchingPodAntiAffinityTerm{term: &term, node: node})
+					nodeResult = append(nodeResult, matchingPodAntiAffinityTerm{term: term.term, node: node})
 				}
 			}
 		}
@@ -1105,15 +1113,30 @@ func (c *PodAffinityChecker) satisfiesExistingPodsAntiAffinity(pod *v1.Pod, meta
 }
 
 // Checks if scheduling the pod onto this node would break any rules of this pod.
-func (c *PodAffinityChecker) satisfiesPodsAffinityAntiAffinity(pod *v1.Pod, node *v1.Node, affinity *v1.Affinity) bool {
+func (c *PodAffinityChecker) satisfiesPodsAffinityAntiAffinity(pod *v1.Pod, meta interface{}, node *v1.Node, affinity *v1.Affinity) bool {
 	allPods, err := c.podLister.List(labels.Everything())
 	if err != nil {
 		return false
 	}
-
+	var affinityTerms []metadataSelectorAndNamespaceForTerm
+	var antiAffinityTerms []metadataSelectorAndNamespaceForTerm
+	if predicateMeta, ok := meta.(*predicateMetadata); ok {
+		affinityTerms = predicateMeta.affinityTerms
+		antiAffinityTerms = predicateMeta.antiAffinityTerms
+	} else {
+		affinityTerms, err = computeSelectorsAndNamespacesForTerms(pod, getPodAffinityTerms(affinity.PodAffinity))
+		if err != nil {
+			return false
+		}
+		antiAffinityTerms, err = computeSelectorsAndNamespacesForTerms(pod, getPodAntiAffinityTerms(affinity.PodAntiAffinity))
+		if err != nil {
+			return false
+		}
+	}
 	// Check all affinity terms.
-	for _, term := range getPodAffinityTerms(affinity.PodAffinity) {
-		termMatches, matchingPodExists, err := c.anyPodMatchesPodAffinityTerm(pod, allPods, node, &term)
+	for i := range affinityTerms {
+		term := affinityTerms[i]
+		termMatches, matchingPodExists, err := c.anyPodMatchesPodAffinityTerm(pod, allPods, node, term.term, term.selector, term.namespaces)
 		if err != nil {
 			glog.V(10).Infof("Cannot schedule pod %+v onto node %v,because of PodAffinityTerm %v, err: %v",
 				podName(pod), node.Name, term, err)
@@ -1123,14 +1146,7 @@ func (c *PodAffinityChecker) satisfiesPodsAffinityAntiAffinity(pod *v1.Pod, node
 			// If the requirement matches a pod's own labels are namespace, and there are
 			// no other such pods, then disregard the requirement. This is necessary to
 			// not block forever because the first pod of the collection can't be scheduled.
-			namespaces := priorityutil.GetNamespacesFromPodAffinityTerm(pod, &term)
-			selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
-			if err != nil {
-				glog.V(10).Infof("Cannot parse selector on term %v for pod %v. Details %v",
-					term, podName(pod), err)
-				return false
-			}
-			match := priorityutil.PodMatchesTermsNamespaceAndSelector(pod, namespaces, selector)
+			match := priorityutil.PodMatchesTermsNamespaceAndSelector(pod, term.namespaces, term.selector)
 			if !match || matchingPodExists {
 				glog.V(10).Infof("Cannot schedule pod %+v onto node %v,because of PodAffinityTerm %v, err: %v",
 					podName(pod), node.Name, term, err)
@@ -1140,8 +1156,9 @@ func (c *PodAffinityChecker) satisfiesPodsAffinityAntiAffinity(pod *v1.Pod, node
 	}
 
 	// Check all anti-affinity terms.
-	for _, term := range getPodAntiAffinityTerms(affinity.PodAntiAffinity) {
-		termMatches, _, err := c.anyPodMatchesPodAffinityTerm(pod, allPods, node, &term)
+	for i := range antiAffinityTerms {
+		term := antiAffinityTerms[i]
+		termMatches, _, err := c.anyPodMatchesPodAffinityTerm(pod, allPods, node, term.term, term.selector, term.namespaces)
 		if err != nil || termMatches {
 			glog.V(10).Infof("Cannot schedule pod %+v onto node %v,because of PodAntiAffinityTerm %v, err: %v",
 				podName(pod), node.Name, term, err)

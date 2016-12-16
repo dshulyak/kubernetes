@@ -40,16 +40,32 @@ func (pfactory *PredicateMetadataFactory) GetMetadata(pod *v1.Pod, nodeNameToInf
 	if pod == nil {
 		return nil
 	}
-	matchingTerms, err := getMatchingAntiAffinityTerms(pod, nodeNameToInfoMap)
+	predicateMetadata := &predicateMetadata{
+		pod:           pod,
+		podBestEffort: isPodBestEffort(pod),
+		podRequest:    GetResourceRequest(pod),
+		podPorts:      GetUsedPorts(pod),
+	}
+	affinity, err := v1.GetAffinityFromPodAnnotations(pod.Annotations)
 	if err != nil {
 		return nil
 	}
-	predicateMetadata := &predicateMetadata{
-		pod:                       pod,
-		podBestEffort:             isPodBestEffort(pod),
-		podRequest:                GetResourceRequest(pod),
-		podPorts:                  GetUsedPorts(pod),
-		matchingAntiAffinityTerms: matchingTerms,
+	if affinity != nil {
+		affinityTerms, err := computeSelectorsAndNamespacesForTerms(pod, getPodAffinityTerms(affinity.PodAffinity))
+		if err != nil {
+			return nil
+		}
+		predicateMetadata.affinityTerms = affinityTerms
+		antiAffinityTerms, err := computeSelectorsAndNamespacesForTerms(pod, getPodAntiAffinityTerms(affinity.PodAntiAffinity))
+		if err != nil {
+			return nil
+		}
+		predicateMetadata.antiAffinityTerms = antiAffinityTerms
+		matchingTerms, err := getMatchingAntiAffinityTerms(pod, nodeNameToInfoMap, antiAffinityTerms)
+		if err != nil {
+			return nil
+		}
+		predicateMetadata.matchingAntiAffinityTerms = matchingTerms
 	}
 	for predicateName, precomputeFunc := range predicatePrecomputations {
 		glog.V(10).Info("Precompute: %v", predicateName)
