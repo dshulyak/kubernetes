@@ -31,6 +31,7 @@ import (
 	"k8s.io/kubernetes/pkg/kubelet/qos"
 	"k8s.io/kubernetes/pkg/labels"
 	utilruntime "k8s.io/kubernetes/pkg/util/runtime"
+	"k8s.io/kubernetes/pkg/util/sets"
 	"k8s.io/kubernetes/pkg/util/workqueue"
 	"k8s.io/kubernetes/plugin/pkg/scheduler/algorithm"
 	priorityutil "k8s.io/kubernetes/plugin/pkg/scheduler/algorithm/priorities/util"
@@ -934,23 +935,17 @@ func (c *PodAffinityChecker) InterPodAffinityMatches(pod *v1.Pod, meta interface
 // First return value indicates whether a matching pod exists on a node that matches the topology key,
 // while the second return value indicates whether a matching pod exists anywhere.
 // TODO: Do we really need any pod matching, or all pods matching? I think the latter.
-func (c *PodAffinityChecker) anyPodMatchesPodAffinityTerm(pod *v1.Pod, allPods []*v1.Pod, node *v1.Node, term *v1.PodAffinityTerm) (bool, bool, error) {
+func (c *PodAffinityChecker) anyPodMatchesPodAffinityTerm(pod *v1.Pod, uniquePods map[string]*podOnNodes, node *v1.Node, term *v1.PodAffinityTerm, namespaces sets.String, selector labels.Selector) (bool, bool, error) {
 	matchingPodExists := false
-	namespaces := priorityutil.GetNamespacesFromPodAffinityTerm(pod, term)
-	selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
-	if err != nil {
-		return false, false, err
-	}
-	for _, existingPod := range allPods {
+	for _, uniquePod := range uniquePods {
+		existingPod := uniquePod.pod
 		match := priorityutil.PodMatchesTermsNamespaceAndSelector(existingPod, namespaces, selector)
 		if match {
 			matchingPodExists = true
-			existingPodNode, err := c.info.GetNodeInfo(existingPod.Spec.NodeName)
-			if err != nil {
-				return false, matchingPodExists, err
-			}
-			if c.failureDomains.NodesHaveSameTopologyKey(node, existingPodNode, term.TopologyKey) {
-				return true, matchingPodExists, nil
+			for _, existingPodNode := range uniquePod.nodes {
+				if c.failureDomains.NodesHaveSameTopologyKey(node, existingPodNode, term.TopologyKey) {
+					return true, matchingPodExists, nil
+				}
 			}
 		}
 	}
@@ -1104,16 +1099,70 @@ func (c *PodAffinityChecker) satisfiesExistingPodsAntiAffinity(pod *v1.Pod, meta
 	return true
 }
 
+type podOnNodes struct {
+	pod   *v1.Pod
+	nodes []*v1.Node
+}
+
+func (c *PodAffinityChecker) prepareUniquePodsByOwnership(allPods []*v1.Pod) (map[string]*podOnNodes, error) {
+	uniquePods := map[string]*podOnNodes{}
+	for _, pod := range allPods {
+		owned := false
+		for _, owner := range pod.OwnerReferences {
+			if !*owner.Controller {
+				continue
+			}
+			owned = true
+			node, err := c.info.GetNodeInfo(pod.Spec.NodeName)
+			if err != nil {
+				return nil, err
+			}
+			ownerUID := string(owner.UID)
+			if _, exist := uniquePods[ownerUID]; !exist {
+				uniquePods[ownerUID] = &podOnNodes{
+					pod:   pod,
+					nodes: []*v1.Node{node},
+				}
+			} else {
+				uniquePods[ownerUID].nodes = append(uniquePods[ownerUID].nodes, node)
+			}
+		}
+		if pod.OwnerReferences == nil || !owned {
+			node, err := c.info.GetNodeInfo(pod.Spec.NodeName)
+			if err != nil {
+				return nil, err
+			}
+
+			uniquePods[podName(pod)] = &podOnNodes{
+				pod:   pod,
+				nodes: []*v1.Node{node},
+			}
+			continue
+		}
+	}
+	return uniquePods, nil
+}
+
 // Checks if scheduling the pod onto this node would break any rules of this pod.
 func (c *PodAffinityChecker) satisfiesPodsAffinityAntiAffinity(pod *v1.Pod, node *v1.Node, affinity *v1.Affinity) bool {
 	allPods, err := c.podLister.List(labels.Everything())
 	if err != nil {
 		return false
 	}
-
+	uniquePods, err := c.prepareUniquePodsByOwnership(allPods)
+	if err != nil {
+		return false
+	}
 	// Check all affinity terms.
 	for _, term := range getPodAffinityTerms(affinity.PodAffinity) {
-		termMatches, matchingPodExists, err := c.anyPodMatchesPodAffinityTerm(pod, allPods, node, &term)
+		namespaces := priorityutil.GetNamespacesFromPodAffinityTerm(pod, &term)
+		selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
+		if err != nil {
+			glog.V(10).Infof("Cannot parse selector on term %v for pod %v. Details %v",
+				term, podName(pod), err)
+			return false
+		}
+		termMatches, matchingPodExists, err := c.anyPodMatchesPodAffinityTerm(pod, uniquePods, node, &term, namespaces, selector)
 		if err != nil {
 			glog.V(10).Infof("Cannot schedule pod %+v onto node %v,because of PodAffinityTerm %v, err: %v",
 				podName(pod), node.Name, term, err)
@@ -1123,13 +1172,6 @@ func (c *PodAffinityChecker) satisfiesPodsAffinityAntiAffinity(pod *v1.Pod, node
 			// If the requirement matches a pod's own labels are namespace, and there are
 			// no other such pods, then disregard the requirement. This is necessary to
 			// not block forever because the first pod of the collection can't be scheduled.
-			namespaces := priorityutil.GetNamespacesFromPodAffinityTerm(pod, &term)
-			selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
-			if err != nil {
-				glog.V(10).Infof("Cannot parse selector on term %v for pod %v. Details %v",
-					term, podName(pod), err)
-				return false
-			}
 			match := priorityutil.PodMatchesTermsNamespaceAndSelector(pod, namespaces, selector)
 			if !match || matchingPodExists {
 				glog.V(10).Infof("Cannot schedule pod %+v onto node %v,because of PodAffinityTerm %v, err: %v",
@@ -1141,7 +1183,14 @@ func (c *PodAffinityChecker) satisfiesPodsAffinityAntiAffinity(pod *v1.Pod, node
 
 	// Check all anti-affinity terms.
 	for _, term := range getPodAntiAffinityTerms(affinity.PodAntiAffinity) {
-		termMatches, _, err := c.anyPodMatchesPodAffinityTerm(pod, allPods, node, &term)
+		namespaces := priorityutil.GetNamespacesFromPodAffinityTerm(pod, &term)
+		selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
+		if err != nil {
+			glog.V(10).Infof("Cannot parse selector on term %v for pod %v. Details %v",
+				term, podName(pod), err)
+			return false
+		}
+		termMatches, _, err := c.anyPodMatchesPodAffinityTerm(pod, uniquePods, node, &term, namespaces, selector)
 		if err != nil || termMatches {
 			glog.V(10).Infof("Cannot schedule pod %+v onto node %v,because of PodAntiAffinityTerm %v, err: %v",
 				podName(pod), node.Name, term, err)

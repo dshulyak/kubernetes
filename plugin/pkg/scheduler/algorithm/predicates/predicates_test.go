@@ -2632,8 +2632,8 @@ func TestInterPodAffinityWithMultipleNodes(t *testing.T) {
 				},
 			},
 			pods: []*v1.Pod{
-				{Spec: v1.PodSpec{NodeName: "nodeA"}, ObjectMeta: v1.ObjectMeta{Labels: map[string]string{"foo": "abc"}}},
-				{Spec: v1.PodSpec{NodeName: "nodeB"}, ObjectMeta: v1.ObjectMeta{Labels: map[string]string{"foo": "def"}}},
+				{Spec: v1.PodSpec{NodeName: "nodeA"}, ObjectMeta: v1.ObjectMeta{Labels: map[string]string{"foo": "abc"}, Name: "pod1"}},
+				{Spec: v1.PodSpec{NodeName: "nodeB"}, ObjectMeta: v1.ObjectMeta{Labels: map[string]string{"foo": "def"}, Name: "pod2"}},
 			},
 			nodes: []v1.Node{
 				{ObjectMeta: v1.ObjectMeta{Name: "nodeA", Labels: map[string]string{"region": "r1", "hostname": "h1"}}},
