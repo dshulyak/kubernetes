@@ -42,7 +42,7 @@ func TestValidatesHostParameter(t *testing.T) {
 		{"host/server", "", "", true},
 	}
 	for i, testCase := range testCases {
-		u, versionedAPIPath, err := DefaultServerURL(testCase.Host, testCase.APIPath, registered.GroupOrDie(api.GroupName).GroupVersion, false)
+		hosts, versionedAPIPath, err := DefaultServerURLsForHosts([]string{testCase.Host}, testCase.APIPath, registered.GroupOrDie(api.GroupName).GroupVersion, false)
 		switch {
 		case err == nil && testCase.Err:
 			t.Errorf("expected error but was nil")
@@ -52,7 +52,11 @@ func TestValidatesHostParameter(t *testing.T) {
 			continue
 		case err != nil:
 			continue
+		case len(hosts) != 1:
+			t.Errorf("unexpected length of returned hosts %v", hosts)
+			continue
 		}
+		u := hosts[0]
 		u.Path = path.Join(u.Path, versionedAPIPath)
 		if e, a := testCase.URL, u.String(); e != a {
 			t.Errorf("%d: expected host %s, got %s", i, e, a)
